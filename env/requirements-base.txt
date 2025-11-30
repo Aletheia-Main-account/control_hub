@@ -1,5 +1,5 @@
-psutil>=5.9.0
-
-sqlite3 is standard library, but we list specific versions if needed
-
-No other heavy deps for the backend core
+# requirements-base.txt updates
+python-dotenv>=1.0.0
+aiohttp>=3.9.0
+arris-tg2492lg>=2.2.0  # The specific driver for your ARRIS router
+mac-vendor-lookup>=0.1.12
