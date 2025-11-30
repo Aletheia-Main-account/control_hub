@@ -1,0 +1,141 @@
+name: Control Hub CI
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  PYTHON_VERSION_FILE: env/runtime-python.txt
+
+jobs:
+  # ─────────────────────────────────────────
+  # Phase 1: Static Analysis & Syntax
+  # ─────────────────────────────────────────
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Read Python Version
+        id: py-ver
+        run: echo "version=$(cat env/runtime-python.txt)" >> $GITHUB_OUTPUT
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ steps.py-ver.outputs.version }}
+          cache: 'pip'
+
+      - name: Install Dev Dependencies
+        run: |
+          pip install -r env/requirements-dev.txt
+
+      - name: Lint (Ruff)
+        run: ruff check .
+
+      - name: Type Check (Mypy)
+        # We ignore missing imports for Streamlit as it's dynamic
+        run: mypy control_hub.py --ignore-missing-imports
+
+  # ─────────────────────────────────────────
+  # Phase 2: Forensic Integration Smoke-Test
+  # ─────────────────────────────────────────
+  integrity-test:
+    runs-on: ubuntu-latest
+    needs: static-analysis
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Runtime Dependencies
+        run: pip install -r env/requirements-dev.txt
+
+      - name: Create Sandbox Environment
+        run: |
+          mkdir -p temp_scan_root
+          echo "Forensic Evidence A" > temp_scan_root/file_a.txt
+          echo "Forensic Evidence B" > temp_scan_root/file_b.txt
+
+      - name: Run Backend Logic Test
+        env:
+          PYTHONUNBUFFERED: 1
+        run: |
+          python - << 'EOF'
+          import threading
+          import time
+          import os
+          import sys
+          import control_hub as ch
+
+          print("--- [CI] Initializing Backend Components ---")
+          
+          # 1. Setup Test Paths
+          TEST_ROOT = os.path.abspath("temp_scan_root")
+          
+          # 2. Initialize Managers
+          fm = ch.FileManager()
+          monitor = ch.SystemMonitor()
+          
+          # 3. Manually Spawn Threads (Non-Daemon for Control)
+          print(f"--- [CI] Spawning Threads on {TEST_ROOT} ---")
+          
+          m_thread = threading.Thread(
+              target=ch.monitor_thread_target,
+              args=(monitor,),
+              daemon=False
+          )
+          
+          # Pass the TEST_ROOT explicitly to the scanner
+          s_thread = threading.Thread(
+              target=ch.scanner_thread_target,
+              args=(fm, TEST_ROOT),
+              daemon=False
+          )
+          
+          m_thread.start()
+          s_thread.start()
+          
+          # 4. Wait for one scan cycle (Scanner Interval is 15s default)
+          # We override the interval in memory for speed if possible, 
+          # but here we just wait.
+          print("--- [CI] Waiting for Scan Cycle... ---")
+          time.sleep(5) 
+          
+          # 5. Trigger Cooperative Shutdown
+          print("--- [CI] Triggering Shutdown Signal ---")
+          ch.SHUTDOWN_EVENT.set()
+          
+          m_thread.join(timeout=5)
+          s_thread.join(timeout=5)
+          
+          if m_thread.is_alive() or s_thread.is_alive():
+              print("FATAL: Threads failed to shut down gracefully.")
+              sys.exit(1)
+              
+          # 6. Verify Persistence (Forensic Check)
+          print("--- [CI] Verifying State Integrity ---")
+          with ch.DATA_LOCK:
+              merkle = ch.SHARED_HUB_DATA.get("merkle_root")
+              status = ch.SHARED_HUB_DATA.get("snapshot_status")
+              
+          print(f"Merkle Root: {merkle}")
+          print(f"Status: {status}")
+          
+          if merkle == "Pending..." or merkle is None:
+              print("FAILURE: Merkle Root was not computed.")
+              sys.exit(1)
+              
+          if not os.path.exists("control_hub_snapshots.db"):
+              print("FAILURE: SQLite Snapshot DB was not created.")
+              sys.exit(1)
+
+          print("SUCCESS: Integrity Cycle Completed.")
+          EOF

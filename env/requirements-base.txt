@@ -1,0 +1,5 @@
+psutil>=5.9.0
+
+sqlite3 is standard library, but we list specific versions if needed
+
+No other heavy deps for the backend core
