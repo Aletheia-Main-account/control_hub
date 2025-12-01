@@ -4,7 +4,7 @@ import time
 import os
 import sys
 import threading
-import requests
+import requests  # <--- THIS WAS MISSING
 import streamlit.components.v1 as components
 from datetime import datetime, timedelta
 from typing import List, Tuple, Optional
@@ -40,19 +40,17 @@ def ensure_background_threads_running():
 
     current_threads = {t.name for t in threading.enumerate()}
     
-    # 1. System Monitor
     if "MonitorThread" not in current_threads:
         print("STREAMLIT: Spawning MonitorThread...")
         monitor = CH.SystemMonitor()
         m_thread = threading.Thread(
             target=CH.monitor_thread_target, 
             args=(monitor,), 
-            daemon=True,
+            daemon=True, # Required for Streamlit
             name="MonitorThread"
         )
         m_thread.start()
     
-    # 2. File Scanner
     if "ScannerThread" not in current_threads:
         print("STREAMLIT: Spawning ScannerThread...")
         scanner_fm = CH.FileManager()
@@ -64,7 +62,7 @@ def ensure_background_threads_running():
         )
         s_thread.start()
 
-    # 3. Network Intel
+    # --- NEW: Spawning Network Intelligence Thread ---
     if "NetworkThread" not in current_threads:
         print("STREAMLIT: Spawning NetworkThread...")
         db_man = CH.SnapshotManager()
@@ -75,17 +73,6 @@ def ensure_background_threads_running():
             name="NetworkThread"
         )
         n_thread.start()
-
-    # 4. Active Defense (ARP Watchdog) - NEW
-    if "ArpWatchdogThread" not in current_threads:
-        print("STREAMLIT: Spawning ArpWatchdogThread...")
-        arp_watch = CH.ArpWatchdog()
-        a_thread = threading.Thread(
-            target=arp_watch.start_loop,
-            daemon=True,
-            name="ArpWatchdogThread"
-        )
-        a_thread.start()
 
     return True
 
@@ -125,9 +112,10 @@ def handle_file_action(action: str, target_paths: List[str], cleanup_folder: Opt
 def render_orchestrator_status():
     """Fetches and displays status from the Flask 'Signaler'."""
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🤖 Meta-Orchestrator")
+    st.sidebar.subheader("ðŸ¤– Meta-Orchestrator")
     
     try:
+        # Attempt to connect to the Flask API
         response = requests.get("http://127.0.0.1:5000/api/status", timeout=1)
         
         if response.status_code == 200:
@@ -135,27 +123,17 @@ def render_orchestrator_status():
             status = data.get("status", "unknown")
             watcher_active = data.get("watcher_active", False)
             events = data.get("events", [])
-            swarm_nodes = data.get("swarm_nodes", {})
             
+            # Status Badge
             if watcher_active:
                 st.sidebar.success(f"Signal Server: {status.upper()}")
             else:
                 st.sidebar.warning("Signal Server: Online (Watcher Stopped)")
             
-            # Swarm Activity
-            if swarm_nodes:
-                st.sidebar.markdown("### 🐝 Swarm Activity")
-                for host, stats in swarm_nodes.items():
-                    with st.sidebar.expander(f"🖥️ {host}", expanded=True):
-                        st.progress(min(float(stats.get('cpu', 0))/100, 1.0), text=f"CPU: {stats.get('cpu')}%")
-                        st.progress(min(float(stats.get('ram', 0))/100, 1.0), text=f"RAM: {stats.get('ram')}%")
-                        st.caption(f"Last heartbeat: {stats.get('last_seen')}")
-            else:
-                st.sidebar.info("No Swarm Agents connected.")
-
-            with st.sidebar.expander("Job Event Stream", expanded=False):
+            # Event Stream in Sidebar
+            with st.sidebar.expander("Job Event Stream", expanded=True):
                 if events:
-                    for event in events[:5]:
+                    for event in events[:5]: # Show last 5
                         st.text(event)
                 else:
                     st.caption("No recent artifacts detected.")
@@ -166,18 +144,11 @@ def render_orchestrator_status():
         st.sidebar.error("Signal Server: OFFLINE")
         st.sidebar.caption("Run 'python app.py' to start.")
 
+
 # --- 4. UI RENDERING ---
 
-def render_security_alerts(alerts: List[str]):
-    """Renders Active Defense Alerts."""
-    if alerts:
-        st.error("🚨 ACTIVE SECURITY THREAT DETECTED 🚨")
-        for alert in alerts:
-            st.markdown(f"**{alert}**")
-        st.markdown("---")
-
 def render_logs():
-    with st.expander("📟 System Console Logs (Forensic Audit)", expanded=False):
+    with st.expander("ðŸ“Ÿ System Console Logs (Forensic Audit)", expanded=False):
         with CH.DATA_LOCK:
             logs = list(CH.SHARED_HUB_DATA["system_logs"])
         
@@ -187,7 +158,7 @@ def render_logs():
             st.info("No logs generated yet.")
 
 def render_system_metrics(metrics_history: dict):
-    st.subheader("📈 System Performance Metrics")
+    st.subheader("ðŸ“ˆ System Performance Metrics")
     cols = st.columns(4)
     
     current_metrics = CH.SHARED_HUB_DATA.get("system_metrics", {})
@@ -207,7 +178,7 @@ def render_system_metrics(metrics_history: dict):
             st.line_chart(df)
 
 def render_integrity_status():
-    st.subheader("🛡️ Integrity & Snapshot Status")
+    st.subheader("ðŸ›¡ï¸ Integrity & Snapshot Status")
     col1, col2 = st.columns(2)
     
     merkle = CH.SHARED_HUB_DATA.get("merkle_root", "Calculating...")
@@ -223,7 +194,7 @@ def render_integrity_status():
         col2.info(f"**Database Status:** {status}")
 
 def render_file_audit(audit_report: dict):
-    st.subheader("🧹 File Audit & Cleanup")
+    st.subheader("ðŸ§¹ File Audit & Cleanup")
     if not audit_report or 'duplicate_groups' not in audit_report:
         st.info("File scan report not yet available...")
         return
@@ -264,7 +235,7 @@ def render_file_audit(audit_report: dict):
             st.session_state['selected_paths'] = edited_df[edited_df['select']]['Path'].tolist()
 
 def render_file_treemap(treemap_data: list):
-    st.subheader("📂 File System Treemap")
+    st.subheader("ðŸ“‚ File System Treemap")
     if not treemap_data:
         st.info("Treemap data is being calculated...")
         return
@@ -284,24 +255,12 @@ def render_file_treemap(treemap_data: list):
     """
     components.html(html_code, height=450)
 
-# --- NEW: NETWORK INTELLIGENCE RENDERER (Updated with Active Defense) ---
-def render_network_intel(network_data: dict, last_scan: float, arp_table: dict):
-    st.subheader("📡 Network Intelligence (NetIntel)")
+# --- NEW: NETWORK INTELLIGENCE RENDERER ---
+def render_network_intel(network_data: dict, last_scan: float):
+    st.subheader("ðŸ“¡ Network Intelligence (NetIntel)")
     
-    # 1. ARP Watchdog Section
-    st.markdown("### 🛡️ Active Defense (Local ARP Table)")
-    if arp_table:
-        arp_df = pd.DataFrame(list(arp_table.items()), columns=['IP Address', 'MAC Address'])
-        st.dataframe(arp_df, use_container_width=True)
-    else:
-        st.info("ARP Table is empty or loading...")
-
-    st.divider()
-
-    # 2. Router Intel Section
-    st.markdown("### 🌐 Router Traffic Analysis")
     if not network_data:
-        st.warning("No router data available. Waiting for next stealth poll...")
+        st.warning("No network data available. Waiting for next stealth poll...")
         return
 
     # Metrics Row
@@ -313,7 +272,7 @@ def render_network_intel(network_data: dict, last_scan: float, arp_table: dict):
     col2.metric("Ghost Tracked (Offline)", total_tracked - online_count)
     if last_scan > 0:
         scan_time = datetime.fromtimestamp(last_scan).strftime('%H:%M:%S')
-        col3.metric("Last Router Scan", scan_time)
+        col3.metric("Last Stealth Scan", scan_time)
 
     # Convert to DataFrame for display
     device_list = list(network_data.values())
@@ -333,20 +292,35 @@ def render_network_intel(network_data: dict, last_scan: float, arp_table: dict):
             'rx_delta': 'Download (Bytes)'
         }, inplace=True)
 
+        # Highlight Bandwidth Hogs
         st.dataframe(
             display_df,
             use_container_width=True,
             column_config={
-                "Status": st.column_config.TextColumn("Status", validate="^(Online|Offline)$"),
-                "Upload (Bytes)": st.column_config.ProgressColumn("Upload Activity", format="%d", min_value=0, max_value=10000000),
-                "Download (Bytes)": st.column_config.ProgressColumn("Download Activity", format="%d", min_value=0, max_value=50000000),
+                "Status": st.column_config.TextColumn(
+                    "Status", 
+                    help="Online or Ghost Tracked",
+                    validate="^(Online|Offline)$"
+                ),
+                "Upload (Bytes)": st.column_config.ProgressColumn(
+                    "Upload Activity", 
+                    format="%d", 
+                    min_value=0, 
+                    max_value=10000000 # Scaling factor for viz
+                ),
+                "Download (Bytes)": st.column_config.ProgressColumn(
+                    "Download Activity", 
+                    format="%d", 
+                    min_value=0, 
+                    max_value=50000000
+                ),
             }
         )
 
 # --- 5. MAIN DASHBOARD ---
 
 def main_dashboard():
-    st.title("🎛️ Control Hub: System & Network Defense")
+    st.title("ðŸŽ›ï¸ Control Hub: System & Network Defense")
     st.caption(f"Scanning Path: `{CH.DUPLICATE_SCAN_PATH}`")
 
     if 'cleanup_folder' not in st.session_state: st.session_state['cleanup_folder'] = os.path.join(os.getcwd(), 'cleanup_folder')
@@ -356,23 +330,25 @@ def main_dashboard():
     
     selected_paths = st.session_state.get('selected_paths', [])
     
-    if st.sidebar.button("🗑️ Delete Selected", disabled=not selected_paths):
+    if st.sidebar.button("ðŸ—‘ï¸ Delete Selected", disabled=not selected_paths):
         success, failure = handle_file_action('delete', selected_paths)
-        if success: st.toast(f"Deleted {success} files.", icon="✅")
-        if failure: st.toast(f"Failed to delete {failure} files.", icon="❌")
+        if success: st.toast(f"Deleted {success} files.", icon="âœ…")
+        if failure: st.toast(f"Failed to delete {failure} files.", icon="âŒ")
         st.session_state['selected_paths'] = []
         time.sleep(1)
         st.rerun()
 
-    if st.sidebar.button("➡️ Move Selected", disabled=not selected_paths):
+    if st.sidebar.button("âž¡ï¸ Move Selected", disabled=not selected_paths):
         success, failure = handle_file_action('move', selected_paths, st.session_state['cleanup_folder'])
-        if success: st.toast(f"Moved {success} files.", icon="✅")
-        if failure: st.toast(f"Failed to move {failure} files.", icon="❌")
+        if success: st.toast(f"Moved {success} files.", icon="âœ…")
+        if failure: st.toast(f"Failed to move {failure} files.", icon="âŒ")
         st.session_state['selected_paths'] = []
         time.sleep(1)
         st.rerun()
         
+# --- CALL THE NEW ORCHESTRATOR RENDERER HERE ---
     render_orchestrator_status()
+
 
     # Data Refresh (Thread-Safe Reading)
     with CH.DATA_LOCK:
@@ -384,13 +360,7 @@ def main_dashboard():
         # Network Data Fetch
         network_data = CH.SHARED_HUB_DATA.get("network_inventory", {}).copy()
         network_last_scan = CH.SHARED_HUB_DATA.get("network_last_scan", 0.0)
-        # Security Data Fetch
-        arp_table = CH.SHARED_HUB_DATA.get("arp_table", {}).copy()
-        security_alerts = list(CH.SHARED_HUB_DATA.get("security_alerts", []))
         
-    # ALERT BANNER
-    render_security_alerts(security_alerts)
-
     progress_text = f"Scanner Cycle: {progress}%"
     st.progress(progress / 100, text=progress_text)
 
@@ -405,11 +375,11 @@ def main_dashboard():
     ])
     
     with tab1: render_system_metrics(metrics_history)
-    with tab2: render_network_intel(network_data, network_last_scan, arp_table) # Pass ARP data
+    with tab2: render_network_intel(network_data, network_last_scan) # New Render Call
     with tab3: render_integrity_status()
     with tab4: render_file_audit(audit_report)
     with tab5: 
-        st.subheader("🔎 Deep Scan")
+        st.subheader("ðŸ”Ž Deep Scan")
         deep_data = audit_report.get('deep_scan_report', {}).get('ranked_files', [])
         if deep_data:
             st.dataframe(pd.DataFrame(deep_data), use_container_width=True)
