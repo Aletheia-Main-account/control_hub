@@ -4,7 +4,7 @@ import time
 import os
 import sys
 import threading
-import requests  # <--- THIS WAS MISSING
+import requests
 import streamlit.components.v1 as components
 from datetime import datetime, timedelta
 from typing import List, Tuple, Optional
@@ -40,17 +40,19 @@ def ensure_background_threads_running():
 
     current_threads = {t.name for t in threading.enumerate()}
     
+    # 1. System Monitor
     if "MonitorThread" not in current_threads:
         print("STREAMLIT: Spawning MonitorThread...")
         monitor = CH.SystemMonitor()
         m_thread = threading.Thread(
             target=CH.monitor_thread_target, 
             args=(monitor,), 
-            daemon=True, # Required for Streamlit
+            daemon=True,
             name="MonitorThread"
         )
         m_thread.start()
     
+    # 2. File Scanner
     if "ScannerThread" not in current_threads:
         print("STREAMLIT: Spawning ScannerThread...")
         scanner_fm = CH.FileManager()
@@ -62,7 +64,7 @@ def ensure_background_threads_running():
         )
         s_thread.start()
 
-    # --- NEW: Spawning Network Intelligence Thread ---
+    # 3. Network Intel
     if "NetworkThread" not in current_threads:
         print("STREAMLIT: Spawning NetworkThread...")
         db_man = CH.SnapshotManager()
@@ -73,6 +75,17 @@ def ensure_background_threads_running():
             name="NetworkThread"
         )
         n_thread.start()
+
+    # 4. Active Defense (ARP Watchdog) - NEW
+    if "ArpWatchdogThread" not in current_threads:
+        print("STREAMLIT: Spawning ArpWatchdogThread...")
+        arp_watch = CH.ArpWatchdog()
+        a_thread = threading.Thread(
+            target=arp_watch.start_loop,
+            daemon=True,
+            name="ArpWatchdogThread"
+        )
+        a_thread.start()
 
     return True
 
@@ -115,7 +128,6 @@ def render_orchestrator_status():
     st.sidebar.subheader("ðŸ¤– Meta-Orchestrator")
     
     try:
-        # Attempt to connect to the Flask API
         response = requests.get("http://127.0.0.1:5000/api/status", timeout=1)
         
         if response.status_code == 200:
@@ -123,17 +135,27 @@ def render_orchestrator_status():
             status = data.get("status", "unknown")
             watcher_active = data.get("watcher_active", False)
             events = data.get("events", [])
+            swarm_nodes = data.get("swarm_nodes", {})
             
-            # Status Badge
             if watcher_active:
                 st.sidebar.success(f"Signal Server: {status.upper()}")
             else:
                 st.sidebar.warning("Signal Server: Online (Watcher Stopped)")
             
-            # Event Stream in Sidebar
-            with st.sidebar.expander("Job Event Stream", expanded=True):
+            # Swarm Activity
+            if swarm_nodes:
+                st.sidebar.markdown("### ðŸ Swarm Activity")
+                for host, stats in swarm_nodes.items():
+                    with st.sidebar.expander(f"ðŸ–¥ï¸ {host}", expanded=True):
+                        st.progress(min(float(stats.get('cpu', 0))/100, 1.0), text=f"CPU: {stats.get('cpu')}%")
+                        st.progress(min(float(stats.get('ram', 0))/100, 1.0), text=f"RAM: {stats.get('ram')}%")
+                        st.caption(f"Last heartbeat: {stats.get('last_seen')}")
+            else:
+                st.sidebar.info("No Swarm Agents connected.")
+
+            with st.sidebar.expander("Job Event Stream", expanded=False):
                 if events:
-                    for event in events[:5]: # Show last 5
+                    for event in events[:5]:
                         st.text(event)
                 else:
                     st.caption("No recent artifacts detected.")
@@ -144,8 +166,15 @@ def render_orchestrator_status():
         st.sidebar.error("Signal Server: OFFLINE")
         st.sidebar.caption("Run 'python app.py' to start.")
 
-
 # --- 4. UI RENDERING ---
+
+def render_security_alerts(alerts: List[str]):
+    """Renders Active Defense Alerts."""
+    if alerts:
+        st.error("ðŸš¨ ACTIVE SECURITY THREAT DETECTED ðŸš¨")
+        for alert in alerts:
+            st.markdown(f"**{alert}**")
+        st.markdown("---")
 
 def render_logs():
     with st.expander("ðŸ“Ÿ System Console Logs (Forensic Audit)", expanded=False):
@@ -255,12 +284,24 @@ def render_file_treemap(treemap_data: list):
     """
     components.html(html_code, height=450)
 
-# --- NEW: NETWORK INTELLIGENCE RENDERER ---
-def render_network_intel(network_data: dict, last_scan: float):
+# --- NEW: NETWORK INTELLIGENCE RENDERER (Updated with Active Defense) ---
+def render_network_intel(network_data: dict, last_scan: float, arp_table: dict):
     st.subheader("ðŸ“¡ Network Intelligence (NetIntel)")
     
+    # 1. ARP Watchdog Section
+    st.markdown("### ðŸ›¡ï¸ Active Defense (Local ARP Table)")
+    if arp_table:
+        arp_df = pd.DataFrame(list(arp_table.items()), columns=['IP Address', 'MAC Address'])
+        st.dataframe(arp_df, use_container_width=True)
+    else:
+        st.info("ARP Table is empty or loading...")
+
+    st.divider()
+
+    # 2. Router Intel Section
+    st.markdown("### ðŸŒ Router Traffic Analysis")
     if not network_data:
-        st.warning("No network data available. Waiting for next stealth poll...")
+        st.warning("No router data available. Waiting for next stealth poll...")
         return
 
     # Metrics Row
@@ -272,7 +313,7 @@ def render_network_intel(network_data: dict, last_scan: float):
     col2.metric("Ghost Tracked (Offline)", total_tracked - online_count)
     if last_scan > 0:
         scan_time = datetime.fromtimestamp(last_scan).strftime('%H:%M:%S')
-        col3.metric("Last Stealth Scan", scan_time)
+        col3.metric("Last Router Scan", scan_time)
 
     # Convert to DataFrame for display
     device_list = list(network_data.values())
@@ -292,28 +333,13 @@ def render_network_intel(network_data: dict, last_scan: float):
             'rx_delta': 'Download (Bytes)'
         }, inplace=True)
 
-        # Highlight Bandwidth Hogs
         st.dataframe(
             display_df,
             use_container_width=True,
             column_config={
-                "Status": st.column_config.TextColumn(
-                    "Status", 
-                    help="Online or Ghost Tracked",
-                    validate="^(Online|Offline)$"
-                ),
-                "Upload (Bytes)": st.column_config.ProgressColumn(
-                    "Upload Activity", 
-                    format="%d", 
-                    min_value=0, 
-                    max_value=10000000 # Scaling factor for viz
-                ),
-                "Download (Bytes)": st.column_config.ProgressColumn(
-                    "Download Activity", 
-                    format="%d", 
-                    min_value=0, 
-                    max_value=50000000
-                ),
+                "Status": st.column_config.TextColumn("Status", validate="^(Online|Offline)$"),
+                "Upload (Bytes)": st.column_config.ProgressColumn("Upload Activity", format="%d", min_value=0, max_value=10000000),
+                "Download (Bytes)": st.column_config.ProgressColumn("Download Activity", format="%d", min_value=0, max_value=50000000),
             }
         )
 
@@ -346,9 +372,7 @@ def main_dashboard():
         time.sleep(1)
         st.rerun()
         
-# --- CALL THE NEW ORCHESTRATOR RENDERER HERE ---
     render_orchestrator_status()
-
 
     # Data Refresh (Thread-Safe Reading)
     with CH.DATA_LOCK:
@@ -360,7 +384,13 @@ def main_dashboard():
         # Network Data Fetch
         network_data = CH.SHARED_HUB_DATA.get("network_inventory", {}).copy()
         network_last_scan = CH.SHARED_HUB_DATA.get("network_last_scan", 0.0)
+        # Security Data Fetch
+        arp_table = CH.SHARED_HUB_DATA.get("arp_table", {}).copy()
+        security_alerts = list(CH.SHARED_HUB_DATA.get("security_alerts", []))
         
+    # ALERT BANNER
+    render_security_alerts(security_alerts)
+
     progress_text = f"Scanner Cycle: {progress}%"
     st.progress(progress / 100, text=progress_text)
 
@@ -375,7 +405,7 @@ def main_dashboard():
     ])
     
     with tab1: render_system_metrics(metrics_history)
-    with tab2: render_network_intel(network_data, network_last_scan) # New Render Call
+    with tab2: render_network_intel(network_data, network_last_scan, arp_table) # Pass ARP data
     with tab3: render_integrity_status()
     with tab4: render_file_audit(audit_report)
     with tab5: 

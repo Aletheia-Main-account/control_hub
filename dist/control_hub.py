@@ -8,6 +8,8 @@ import sqlite3
 import signal
 import sys
 import json
+import subprocess
+import re
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict, deque
@@ -37,7 +39,10 @@ SHARED_HUB_DATA: Dict[str, Any] = {
     "merkle_root": "Pending...", 
     "snapshot_status": "Initializing...",
     "network_inventory": {},
-    "network_last_scan": 0.0
+    "network_last_scan": 0.0,
+    # --- NEW: ACTIVE DEFENSE STATE ---
+    "arp_table": {},
+    "security_alerts": [] 
 }
 DATA_LOCK = threading.RLock() 
 
@@ -47,6 +52,7 @@ SHUTDOWN_EVENT = threading.Event()
 # --- 2. CONFIGURATION ---
 MONITOR_INTERVAL_SEC = 1 
 SCANNER_INTERVAL_SEC = 15
+ARP_POLL_INTERVAL_SEC = 5 # Aggressive polling for security
 DUPLICATE_SCAN_PATH = os.getenv("CONTROL_HUB_SCAN_ROOT", os.path.join(os.getcwd(), 'sandbox_data'))
 PROCESS_MONITOR_HISTORY = 60
 TREEMAP_CANVAS_SIZE = (1200, 700) 
@@ -181,10 +187,6 @@ class SnapshotManager:
                 cursor = conn.cursor()
                 cursor.execute("INSERT INTO snapshots (timestamp, merkle_root) VALUES (?, ?)", (timestamp, merkle_root))
                 snapshot_id = cursor.lastrowid
-                
-                # In a real app, you would optimize this to not re-insert existing blobs
-                # For now, we just log the manifest
-                # Note: Full manifest saving omitted for brevity/speed in this context
                 conn.commit()
         except sqlite3.Error as e:
             log_message(f"Snapshot Save Error: {e}")
@@ -195,7 +197,6 @@ class SnapshotManager:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 for d in devices:
-                    # 1. Update Inventory (Upsert)
                     cursor.execute("""
                         INSERT INTO device_inventory (mac_address, vendor, first_seen, last_seen, last_ip, last_hostname)
                         VALUES (?, ?, ?, ?, ?, ?)
@@ -205,7 +206,6 @@ class SnapshotManager:
                             last_hostname=excluded.last_hostname
                     """, (d['mac'], d['vendor'], now, now, d['ip'], d['hostname']))
                     
-                    # 2. Log Traffic Stats
                     cursor.execute("""
                         INSERT INTO network_traffic_log (timestamp, mac_address, tx_delta, rx_delta, signal_strength)
                         VALUES (?, ?, ?, ?, ?)
@@ -406,7 +406,69 @@ class FileManager:
             log_message(f"ERROR: Failed to move {source_path} - {e}")
             return False
 
-# --- 7. NETWORK INTELLIGENCE (NetIntel) ---
+# --- 7. NEW: ACTIVE DEFENSE (ARP WATCHDOG) ---
+class ArpWatchdog:
+    """Monitors the system ARP table for poisoning attacks."""
+    def __init__(self):
+        self.ip_mac_map = {}
+        self.mac_ip_map = defaultdict(list)
+        
+    def _parse_arp_table(self):
+        """Cross-platform ARP table parser."""
+        current_map = {}
+        try:
+            if sys.platform == "win32":
+                output = subprocess.check_output("arp -a", shell=True).decode("cp437") # Safe encoding
+                # Regex for Windows: IP ... MAC ... Type
+                matches = re.findall(r"(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F-]{17})\s+(\w+)", output)
+                for ip, mac, type_ in matches:
+                    if type_ == "dynamic":
+                        current_map[ip] = mac.replace('-', ':').upper()
+            else:
+                # Linux/Unix/Mac
+                output = subprocess.check_output("arp -a", shell=True).decode("utf-8")
+                # Typical format: ? (192.168.1.1) at 0:50:56:c0:0:8 on eth0
+                matches = re.findall(r"\((\d{1,3}(?:\.\d{1,3}){3})\) at ([0-9a-fA-F:]{17})", output)
+                for ip, mac in matches:
+                    current_map[ip] = mac.upper()
+        except Exception as e:
+            log_message(f"ARP Parse Error: {e}")
+        return current_map
+
+    def scan_cycle(self):
+        """Detects duplicate MACs (Poisoning) and Gateway changes."""
+        new_map = self._parse_arp_table()
+        alerts = []
+        
+        # Invert map to check for MACs claiming multiple IPs
+        inverted_map = defaultdict(list)
+        for ip, mac in new_map.items():
+            inverted_map[mac].append(ip)
+            
+        # Analysis Rule 1: MAC Spoofing (One MAC, Multiple IPs)
+        for mac, ips in inverted_map.items():
+            if len(ips) > 1 and "FF:FF:FF:FF:FF:FF" not in mac:
+                # Whitelist Broadcasts/Multicasts if needed
+                alerts.append(f"[CRITICAL] ARP POISONING DETECTED: MAC {mac} is claiming IPs: {ips}")
+
+        # Update Shared State
+        with DATA_LOCK:
+            SHARED_HUB_DATA["arp_table"] = new_map
+            if alerts:
+                # Append unique alerts
+                existing = set(SHARED_HUB_DATA["security_alerts"])
+                for a in alerts:
+                    if a not in existing:
+                        SHARED_HUB_DATA["security_alerts"].append(a)
+                        log_message(a)
+
+    def start_loop(self):
+        log_message("Active Defense: ARP Watchdog Started.")
+        while not SHUTDOWN_EVENT.is_set():
+            self.scan_cycle()
+            time.sleep(ARP_POLL_INTERVAL_SEC)
+
+# --- 8. NETWORK INTELLIGENCE (NetIntel) ---
 try:
     from arris_tg2492lg import ConnectBox
     from mac_vendor_lookup import MacLookup
@@ -448,7 +510,6 @@ class NetworkManager:
         timestamp = datetime.now().isoformat()
         
         # --- SIMULATION MODE ---
-        # Set to False if you have the ARRIS hardware and correct credentials
         use_simulation = True 
 
         if use_simulation or not ConnectBox or not self.router_pass:
@@ -481,7 +542,6 @@ class NetworkManager:
                 SHARED_HUB_DATA["network_last_scan"] = time.time()
                 
             self.db_manager.save_network_log(live_devices)
-            log_message("NetIntel: (SIMULATION) Scan Complete.")
             return
 
         # --- REAL HARDWARE LOGIC ---
@@ -547,8 +607,52 @@ class NetworkManager:
         loop.close()
         log_message("NetIntel: Stopped.")
 
-# --- 8. THREAD WORKERS ---
-def monitor_thread_target(monitor_instance: SystemMonitor):
+# --- 9. MAIN EXECUTION AGENT ---
+def start_background_threads():
+    # 1. System Monitor
+    monitor = SystemMonitor()
+    m_thread = threading.Thread(
+        target=monitor_thread_target, 
+        args=(monitor,), 
+        daemon=False,
+        name="MonitorThread"
+    )
+    
+    # 2. File Scanner
+    scanner_fm = FileManager()
+    s_thread = threading.Thread(
+        target=scanner_thread_target, 
+        args=(scanner_fm, DUPLICATE_SCAN_PATH), 
+        daemon=False,
+        name="ScannerThread"
+    )
+
+    # 3. Network Intel
+    db_man = SnapshotManager()
+    net_man = NetworkManager(db_man)
+    n_thread = threading.Thread(
+        target=net_man.start_loop,
+        daemon=False,
+        name="NetworkThread"
+    )
+
+    # 4. Active Defense (ARP Watchdog)
+    arp_watch = ArpWatchdog()
+    a_thread = threading.Thread(
+        target=arp_watch.start_loop,
+        daemon=False,
+        name="ArpWatchdogThread"
+    )
+
+    m_thread.start()
+    s_thread.start()
+    n_thread.start()
+    a_thread.start() # Start the hunter
+
+    return [m_thread, s_thread, n_thread, a_thread]
+
+# WRAPPER TARGETS for Threads
+def monitor_thread_target(monitor_instance):
     log_message("Monitor Thread Started.")
     while not SHUTDOWN_EVENT.is_set():
         current_metrics = monitor_instance.update_metrics()
@@ -561,7 +665,7 @@ def monitor_thread_target(monitor_instance: SystemMonitor):
         time.sleep(MONITOR_INTERVAL_SEC)
     log_message("Monitor Thread Stopped.")
 
-def scanner_thread_target(file_manager_instance: FileManager, path: str):
+def scanner_thread_target(file_manager_instance, path):
     DEEP_SCAN_KEYWORDS = ['report', 'invoice', 'backup', 'log', 'config', 'temp', 'data', 'secret']
     snapshot_mgr = SnapshotManager()
     log_message(f"Scanner Thread Started on path: {path}")
@@ -619,38 +723,6 @@ def scanner_thread_target(file_manager_instance: FileManager, path: str):
             time.sleep(1)
 
     log_message("Scanner Thread Stopped.")
-
-# --- 9. MAIN EXECUTION AGENT ---
-def start_background_threads():
-    monitor = SystemMonitor()
-    m_thread = threading.Thread(
-        target=monitor_thread_target, 
-        args=(monitor,), 
-        daemon=False,
-        name="MonitorThread"
-    )
-    
-    scanner_fm = FileManager()
-    s_thread = threading.Thread(
-        target=scanner_thread_target, 
-        args=(scanner_fm, DUPLICATE_SCAN_PATH), 
-        daemon=False,
-        name="ScannerThread"
-    )
-
-    db_man = SnapshotManager()
-    net_man = NetworkManager(db_man)
-    n_thread = threading.Thread(
-        target=net_man.start_loop,
-        daemon=False,
-        name="NetworkThread"
-    )
-
-    m_thread.start()
-    s_thread.start()
-    n_thread.start()
-
-    return [m_thread, s_thread, n_thread]
 
 if __name__ == "__main__":
     def signal_handler(sig, frame):
