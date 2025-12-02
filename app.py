@@ -2,6 +2,7 @@
 from flask import Flask, jsonify, request
 import threading
 import time
+import subprocess
 from datetime import datetime
 from provenance_watcher import ProvenanceWatcher
 
@@ -63,6 +64,42 @@ def ingest_telemetry():
 @app.route('/api/start-simulation', methods=['POST'])
 def start_simulation():
     return jsonify({"msg": "Simulation dispatched", "status": "PENDING"}), 202
+
+# --- LANE 1: COMMAND & CONTROL (For Xbox 360) ---
+@app.route('/api/control/dispatch', methods=['POST'])
+def dispatch_command():
+    """
+    Receives 'Launch' triggers from the Xbox 360.
+    Payload: {"action": "START_PHYSICS_SIM", "target": "DATTOWER"}
+    """
+    data = request.json
+    if not data:
+        return jsonify({"error": "No command data"}), 400
+
+    action = data.get("action")
+    target = data.get("target", "Global")
+    timestamp = datetime.now().strftime("%H:%M:%S")
+
+    # 1. Log the Command
+    event_msg = f"[{timestamp}] 🎮 Xbox 360 Trigger: {action} -> {target}"
+    watcher.events.appendleft(event_msg)
+    print(f"--- {event_msg}")
+
+    # 2. (Future) Actually execute the python script
+    # if action == "START_PHYSICS_SIM":
+    #     subprocess.Popen(["python", "heavy_sim.py"])
+
+    return jsonify({"status": "Command Received", "action": action}), 200
+
+# --- LANE 2: VISUALIZATION STREAM (For Xbox One) ---
+@app.route('/api/viz/stream', methods=['GET'])
+def get_viz_stream():
+    """
+    Serves raw telemetry data for the Xbox One Unity App to render in 3D.
+    """
+    with STATE_LOCK:
+        # Return the entire swarm state so Unity can render it
+        return jsonify(SWARM_STATE)
 
 if __name__ == '__main__':
     print("--- Swarm Orchestrator (Server) Starting on Port 5000 ---")

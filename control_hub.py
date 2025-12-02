@@ -157,13 +157,24 @@ class SnapshotManager:
                     )
                 """)
                 conn.execute("""
-                    CREATE TABLE IF NOT EXISTS network_traffic_log (
+                    CREATE TABLE IF NOT EXISTS network_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        mac_address TEXT,
+                        rssi INTEGER,
+                        tx_bytes INTEGER,
+                        rx_bytes INTEGER,
+                        timestamp TEXT
+                    )
+                """)
+                
+                # --- NEW: Flight Recorder Table (System Stats) ---
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS system_stats (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         timestamp TEXT,
-                        mac_address TEXT,
-                        tx_delta INTEGER,
-                        rx_delta INTEGER,
-                        signal_strength INTEGER
+                        cpu_percent REAL,
+                        ram_percent REAL,
+                        disk_percent REAL
                     )
                 """)
                 conn.commit()
@@ -191,12 +202,13 @@ class SnapshotManager:
         except sqlite3.Error as e:
             log_message(f"Snapshot Save Error: {e}")
 
-    def save_network_log(self, devices: List[Dict]):
-        now = datetime.now().isoformat()
+    def save_network_log(self, devices: List[Dict], timestamp: Optional[str] = None):
+        now = timestamp or datetime.now().isoformat()
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 for d in devices:
+                    first_seen = d.get('first_seen', now)
                     cursor.execute("""
                         INSERT INTO device_inventory (mac_address, vendor, first_seen, last_seen, last_ip, last_hostname)
                         VALUES (?, ?, ?, ?, ?, ?)
@@ -204,15 +216,41 @@ class SnapshotManager:
                             last_seen=excluded.last_seen,
                             last_ip=excluded.last_ip,
                             last_hostname=excluded.last_hostname
-                    """, (d['mac'], d['vendor'], now, now, d['ip'], d['hostname']))
-                    
+                    """, (
+                        d['mac'],
+                        d.get('vendor', 'Unknown Vendor'),
+                        first_seen,
+                        now,
+                        d.get('ip'),
+                        d.get('hostname')
+                    ))
+
                     cursor.execute("""
-                        INSERT INTO network_traffic_log (timestamp, mac_address, tx_delta, rx_delta, signal_strength)
+                        INSERT INTO network_logs (mac_address, rssi, tx_bytes, rx_bytes, timestamp)
                         VALUES (?, ?, ?, ?, ?)
-                    """, (now, d['mac'], d['tx_delta'], d['rx_delta'], d['signal_strength']))
+                    """, (
+                        d['mac'],
+                        d.get('signal_strength'),
+                        d.get('tx_delta', 0),
+                        d.get('rx_delta', 0),
+                        now
+                    ))
                 conn.commit()
         except sqlite3.Error as e:
             log_message(f"DB Network Save Error: {e}")
+
+    # --- NEW: Save System Metrics (Flight Recorder) ---
+    def save_system_metrics(self, metrics: Dict):
+        now = datetime.now().isoformat()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO system_stats (timestamp, cpu_percent, ram_percent, disk_percent) VALUES (?, ?, ?, ?)",
+                    (now, metrics.get('cpu_util', 0), metrics.get('mem_util', 0), 0)
+                )
+                conn.commit()
+        except Exception as e:
+            log_message(f"DB Metrics Error: {e}")
 
 # --- 6. CORE MONITORING CLASSES ---
 class SystemMonitor:
@@ -654,14 +692,23 @@ def start_background_threads():
 # WRAPPER TARGETS for Threads
 def monitor_thread_target(monitor_instance):
     log_message("Monitor Thread Started.")
+    # Create a dedicated DB manager for this thread
+    snapshot_mgr = SnapshotManager() 
+    
     while not SHUTDOWN_EVENT.is_set():
         current_metrics = monitor_instance.update_metrics()
+        
+        # 1. Update In-Memory State (For Dashboard)
         with DATA_LOCK:
             SHARED_HUB_DATA["system_metrics"] = current_metrics
             SHARED_HUB_DATA["metric_history"] = {k: list(v) for k, v in monitor_instance.metrics.items()}
             elapsed = time.time() - SHARED_HUB_DATA["scan_start_timestamp"]
             if SHARED_HUB_DATA["scan_progress"] < 100:
                 SHARED_HUB_DATA["scan_progress"] = min(95, int((elapsed / SCANNER_INTERVAL_SEC) * 100))
+        
+        # 2. NEW: Persist to Database (Flight Recorder)
+        snapshot_mgr.save_system_metrics(current_metrics)
+        
         time.sleep(MONITOR_INTERVAL_SEC)
     log_message("Monitor Thread Stopped.")
 
